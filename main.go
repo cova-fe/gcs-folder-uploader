@@ -17,18 +17,16 @@ import (
 
 	"cloud.google.com/go/storage"
 	"github.com/fsnotify/fsnotify"
-	"github.com/keybase/go-keychain" // Corrected import and usage
+	"github.com/keybase/go-keychain"
 	"google.golang.org/api/impersonate"
 	"google.golang.org/api/option"
 )
 
 // Configuration constants
 const (
-	DebounceDuration = 200 * time.Millisecond
-
-	// Keychain constants for storing/retrieving the service account KEY JSON
-	keychainSAKeyService = "gcp-file-sync-sa-key"
-	keychainSAKeyAccount = "default"
+	DebounceDuration          = 1 * time.Second      // Debounce time
+	FileStabilityCheckInterval = 100 * time.Millisecond // How often to check file size
+	FileStabilityDuration      = 500 * time.Millisecond   // How long file size must be stable
 )
 
 // Global variables for command-line parameters
@@ -42,14 +40,17 @@ var (
 	// Debouncing mechanism for file events
 	debounceMap   = make(map[string]*time.Timer)
 	debounceMutex sync.Mutex
-)
 
-// Versioning and Build Information (These will be set by the linker at build time)
-var (
+	// Versioning and Build Information (These will be set by the linker at build time)
 	version     = "dev"
 	buildTime   = "unknown"
 	bundleIdent = "org.example.example"
+
+	// Keychain variables for storing/retrieving the service account KEY JSON
+	keychainSAKeyService = "gcp-file-sync-sa-key"
+	keychainSAKeyAccount = "default" // Using "default" as a common identifier for the key
 )
+
 
 func main() {
 	// 1. Define command-line flags
@@ -67,6 +68,10 @@ func main() {
 
 	// 2. Parse the command-line flags
 	flag.Parse()
+
+	// Configure standard logger to write to os.Stdout for general messages.
+	// Fatal errors will still typically go to stderr before exiting.
+	log.SetOutput(os.Stdout)
 
 	// Handle version flag
 	if *versionFlag {
@@ -132,6 +137,8 @@ func main() {
 		log.Println("Verbose logging is DISABLED. Only critical messages will be shown.")
 	}
 	log.Printf("Debounce duration for file events: %s", DebounceDuration)
+	log.Printf("File stability check duration: %s", FileStabilityDuration)
+
 
 	// --- Initial Scan ---
 	log.Println("Performing initial scan of source folder for existing files...")
@@ -174,12 +181,14 @@ func main() {
 				if !ok {
 					return
 				}
-				if event.Op&fsnotify.Create == fsnotify.Create ||
-					event.Op&fsnotify.Write == fsnotify.Write ||
-					event.Op&fsnotify.Chmod == fsnotify.Chmod {
+				// We care about creation and writes
+				// CHMOD events can indicate a file is "finished" being written
+				// RENAME/REMOVE for tracking if file disappears before processing
+				if event.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Chmod) != 0 {
 					if isVerbose {
 						log.Printf("Detected event: %s on file: %s", event.Op.String(), event.Name)
 					}
+					// Use the wrapper to debounce and process the file
 					go processFileWrapper(event.Name)
 				}
 			case err, ok := <-watcher.Errors:
@@ -228,6 +237,7 @@ func processFileWrapper(filePath string) {
 
 // processSingleFile contains the core logic for uploading and deleting a single file.
 func processSingleFile(filePath string) {
+	// First, check if the file still exists and is not a directory
 	fileInfo, err := os.Stat(filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -251,11 +261,18 @@ func processSingleFile(filePath string) {
 
 	log.Printf("Attempting to upload file: %s", filePath)
 
+	// Wait for file stability before opening
+	if err := waitForFileStability(filePath, FileStabilityDuration, FileStabilityCheckInterval); err != nil {
+		log.Printf("Error waiting for file stability for %s: %v, skipping upload.", filePath, err)
+		return
+	}
+
 	f, err := os.Open(filePath)
 	if err != nil {
 		log.Printf("Error opening file %s: %v", filePath, err)
 		return
 	}
+	// Defer closing the file until function exits
 	defer func() {
 		if err := f.Close(); err != nil {
 			log.Printf("Error closing file %s: %v", filePath, err)
@@ -299,7 +316,22 @@ func processSingleFile(filePath string) {
 	}
 	defer client.Close()
 
-	wc := client.Bucket(bucketName).Object(objectName).NewWriter(ctx)
+	obj := client.Bucket(bucketName).Object(objectName)
+	if _, err := obj.Attrs(ctx); err == nil {
+		log.Printf("File '%s' already exists in GCS bucket '%s'. Skipping upload, proceeding with local deletion.", objectName, bucketName)
+		sendNotification("File Existed", fmt.Sprintf("File '%s' already existed in GCS bucket '%s'. Local file deleted.", objectName, bucketName))
+		if err := os.Remove(filePath); err != nil {
+			log.Printf("Error deleting file %s (already on GCS) after checking existence: %v", filePath, err)
+		} else {
+			log.Printf("Successfully deleted local file: %s (after confirming GCS existence)", filePath)
+		}
+		return
+	} else if err != storage.ErrObjectNotExist {
+		log.Printf("Error checking existence of %s in GCS bucket %s: %v. Skipping upload.", objectName, bucketName, err)
+		return
+	}
+
+	wc := obj.NewWriter(ctx)
 	if _, err = io.Copy(wc, f); err != nil {
 		log.Printf("Error uploading %s to %s/%s: %v", filePath, bucketName, objectName, err)
 		wc.Close()
@@ -318,7 +350,36 @@ func processSingleFile(filePath string) {
 	if err := os.Remove(filePath); err != nil {
 		log.Printf("Error deleting file %s after upload: %v", filePath, err)
 	} else {
-		log.Printf("Successfully deleted local file: %s", filePath)
+			log.Printf("Successfully deleted local file: %s", filePath)
+	}
+}
+
+// waitForFileStability checks if a file's size remains stable over a duration.
+func waitForFileStability(filePath string, duration, interval time.Duration) error {
+	lastSize := int64(-1)
+	stableStartTime := time.Now()
+
+	for {
+		fileInfo, err := os.Stat(filePath)
+		if err != nil {
+			return fmt.Errorf("could not stat file during stability check: %v", err)
+		}
+
+		currentSize := fileInfo.Size()
+
+		if lastSize == -1 {
+			lastSize = currentSize
+		} else if currentSize != lastSize {
+			// Size changed, reset stability timer
+			lastSize = currentSize
+			stableStartTime = time.Now()
+		}
+
+		if time.Since(stableStartTime) >= duration {
+			return nil // File size has been stable for the required duration
+		}
+
+		time.Sleep(interval) // Wait for the next check
 	}
 }
 
