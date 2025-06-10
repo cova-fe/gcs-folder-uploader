@@ -17,22 +17,27 @@ import (
 
 	"cloud.google.com/go/storage"
 	"github.com/fsnotify/fsnotify"
+	"github.com/keybase/go-keychain" // Corrected import and usage
 	"google.golang.org/api/impersonate"
 	"google.golang.org/api/option"
 )
 
 // Configuration constants
 const (
-	DebounceDuration = 200 * time.Millisecond // Time to wait before processing a file after an event
+	DebounceDuration = 200 * time.Millisecond
+
+	// Keychain constants for storing/retrieving the service account KEY JSON
+	keychainSAKeyService = "gcp-file-sync-sa-key"
+	keychainSAKeyAccount = "default"
 )
 
 // Global variables for command-line parameters
 var (
-	sourceFolder              string
-	bucketName                string
-	projectID                 string
+	sourceFolder            string
+	bucketName              string
+	projectID               string
 	impersonateServiceAccount string
-	isVerbose                 bool
+	isVerbose               bool
 
 	// Debouncing mechanism for file events
 	debounceMap   = make(map[string]*time.Timer)
@@ -41,29 +46,55 @@ var (
 
 // Versioning and Build Information (These will be set by the linker at build time)
 var (
-	version     = "dev"                 // Default value, overridden by Makefile
-	buildTime   = "unknown"             // Default value, overridden by Makefile
-	bundleIdent = "org.example.example" // IMPORTANT: This should match BUNDLE_ID from Makefile
+	version     = "dev"
+	buildTime   = "unknown"
+	bundleIdent = "org.example.example"
 )
 
 func main() {
+	// 1. Define command-line flags
 	flag.StringVar(&sourceFolder, "source", "", "Path to the folder to monitor for files (e.g., /path/to/your/files)")
 	flag.StringVar(&bucketName, "bucket", "", "Name of the Google Cloud Storage bucket (e.g., my-unique-bucket)")
 	flag.StringVar(&projectID, "project", "", "Optional: Your Google Cloud Project ID. If not provided, it will be inferred from credentials.")
-	flag.StringVar(&impersonateServiceAccount, "impersonate-sa", "", "Optional: Email of the service account to impersonate (e.g., file-uploader-sa@your-project-id.iam.gserviceaccount.com)")
+	flag.StringVar(&impersonateServiceAccount, "impersonate-sa", "", "Optional: Email of the service account to impersonate (e.g., file-uploader-sa@your-project-id.iam.gserviceaccount.com). Only used if no SA key is found in Keychain.")
 	flag.BoolVar(&isVerbose, "verbose", false, "Enable verbose logging, including periodic scan messages.")
 
+	// Add a flag to show version information
 	versionFlag := flag.Bool("version", false, "Display version and build information")
 
+	// Flag to store the service account KEY file path in Keychain
+	setSAKeyPathFlag := flag.String("set-sa-key-path", "", "Path to a Google Cloud Service Account JSON key file to store in Apple Keychain.")
+
+	// 2. Parse the command-line flags
 	flag.Parse()
 
+	// Handle version flag
 	if *versionFlag {
 		fmt.Printf("Application Version: %s\n", version)
 		fmt.Printf("Build Time: %s\n", buildTime)
 		fmt.Printf("Bundle Identifier: %s\n", bundleIdent)
-		os.Exit(0) // Exit after displaying version
+		os.Exit(0)
 	}
 
+	// Handle --set-sa-key-path flag
+	if *setSAKeyPathFlag != "" {
+		if runtime.GOOS != "darwin" {
+			log.Fatalf("Error: --set-sa-key-path is only supported on macOS.")
+		}
+		keyContent, err := os.ReadFile(*setSAKeyPathFlag)
+		if err != nil {
+			log.Fatalf("Error reading service account key file '%s': %v", *setSAKeyPathFlag, err)
+		}
+		log.Printf("Attempting to store service account key from '%s' in Keychain...", *setSAKeyPathFlag)
+		err = storeServiceAccountKeyInKeychain(keyContent)
+		if err != nil {
+			log.Fatalf("Error storing service account key in Keychain: %v", err)
+		}
+		log.Printf("Successfully stored service account key in Keychain for service '%s', account '%s'.", keychainSAKeyService, keychainSAKeyAccount)
+		os.Exit(0)
+	}
+
+	// 3. Validate required parameters
 	if sourceFolder == "" {
 		log.Fatal("Error: --source parameter is required. Please specify the folder to monitor.")
 	}
@@ -71,6 +102,7 @@ func main() {
 		log.Fatal("Error: --bucket parameter is required. Please specify the GCP bucket name.")
 	}
 
+	// Validate source folder existence
 	_, err := os.Stat(sourceFolder)
 	if os.IsNotExist(err) {
 		log.Fatalf("Error: Source folder '%s' does not exist. Please create it or update --source parameter.", sourceFolder)
@@ -83,9 +115,17 @@ func main() {
 	if projectID != "" {
 		log.Printf("GCP Project ID: %s", projectID)
 	}
-	if impersonateServiceAccount != "" {
-		log.Printf("Impersonating Service Account: %s", impersonateServiceAccount)
+
+	// --- Authentication Strategy Logging ---
+	keychainKeyContent, keychainErr := getServiceAccountKeyFromKeychain()
+	if runtime.GOOS == "darwin" && keychainErr == nil && len(keychainKeyContent) > 0 {
+		log.Println("Authentication strategy: Using Service Account Key from Apple Keychain.")
+	} else if impersonateServiceAccount != "" {
+		log.Printf("Authentication strategy: Impersonating Service Account: %s (Key not found in Keychain).", impersonateServiceAccount)
+	} else {
+		log.Println("WARNING: No service account key found in Keychain and no impersonation SA provided. Using Application Default Credentials (may not be sufficient for GCS access).")
 	}
+
 	if isVerbose {
 		log.Println("Verbose logging is ENABLED.")
 	} else {
@@ -126,29 +166,25 @@ func main() {
 	log.Printf("Monitoring folder '%s' for file system events...", sourceFolder)
 
 	// Goroutine to handle file system events
-	done := make(chan bool) // Channel to signal when to stop
+	done := make(chan bool)
 	go func() {
 		for {
 			select {
 			case event, ok := <-watcher.Events:
 				if !ok {
-					return // Channel closed, watcher is shutting down
+					return
 				}
-				// We care about creation and writes
-				// CHMOD events can indicate a file is "finished" being written
 				if event.Op&fsnotify.Create == fsnotify.Create ||
 					event.Op&fsnotify.Write == fsnotify.Write ||
-					event.Op&fsnotify.Chmod == fsnotify.Chmod { // Chmod can signify file completion
+					event.Op&fsnotify.Chmod == fsnotify.Chmod {
 					if isVerbose {
 						log.Printf("Detected event: %s on file: %s", event.Op.String(), event.Name)
 					}
-					// Use the wrapper to debounce and process the file
-					// It's important to pass the absolute path
 					go processFileWrapper(event.Name)
 				}
 			case err, ok := <-watcher.Errors:
 				if !ok {
-					return // Channel closed
+					return
 				}
 				log.Printf("Watcher error: %v", err)
 			}
@@ -157,13 +193,15 @@ func main() {
 
 	// --- Graceful Shutdown ---
 	sigChan := make(chan os.Signal, 1)
-	// Listen for Ctrl+C (SIGINT) or kill signal (SIGTERM)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan // Block until a signal is received
+	<-sigChan
 
 	log.Println("Received shutdown signal. Exiting gracefully...")
-	// Signal the event processing goroutine to stop (though defer watcher.Close() handles much of it)
-	done <- true
+	select {
+	case done <- true:
+	case <-time.After(1 * time.Second):
+		log.Println("Timeout waiting for event goroutine to acknowledge shutdown.")
+	}
 }
 
 // processFileWrapper handles debouncing of file events before actual processing.
@@ -171,20 +209,16 @@ func processFileWrapper(filePath string) {
 	debounceMutex.Lock()
 	defer debounceMutex.Unlock()
 
-	// If a timer already exists for this file, stop it (reset the debounce)
 	if timer, exists := debounceMap[filePath]; exists {
 		timer.Stop()
 	}
 
-	// Schedule processing after DebounceDuration
 	timer := time.AfterFunc(DebounceDuration, func() {
-		// This anonymous function runs in a new goroutine, so it's safe for concurrent processing.
 		if isVerbose {
 			log.Printf("Processing debounced file: %s", filePath)
 		}
 		processSingleFile(filePath)
 
-		// Remove the file from the debounce map after processing
 		debounceMutex.Lock()
 		delete(debounceMap, filePath)
 		debounceMutex.Unlock()
@@ -194,7 +228,6 @@ func processFileWrapper(filePath string) {
 
 // processSingleFile contains the core logic for uploading and deleting a single file.
 func processSingleFile(filePath string) {
-	// First, check if the file still exists and is not a directory
 	fileInfo, err := os.Stat(filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -214,7 +247,7 @@ func processSingleFile(filePath string) {
 		return
 	}
 
-	objectName := fileInfo.Name() // Use basename for the GCS object name
+	objectName := fileInfo.Name()
 
 	log.Printf("Attempting to upload file: %s", filePath)
 
@@ -223,23 +256,22 @@ func processSingleFile(filePath string) {
 		log.Printf("Error opening file %s: %v", filePath, err)
 		return
 	}
-	// Defer closing the file until function exits
 	defer func() {
 		if err := f.Close(); err != nil {
 			log.Printf("Error closing file %s: %v", filePath, err)
 		}
 	}()
 
-	ctx := context.Background() // Context for GCS operations
+	ctx := context.Background()
 
-	// Configure client options, including impersonation if requested
 	var clientOptions []option.ClientOption
-	if projectID != "" {
-		clientOptions = append(clientOptions, option.WithQuotaProject(projectID))
-	}
 
-	// Add impersonation option if --impersonate-sa is provided
-	if impersonateServiceAccount != "" {
+	keychainKeyContent, keychainErr := getServiceAccountKeyFromKeychain()
+	if runtime.GOOS == "darwin" && keychainErr == nil && len(keychainKeyContent) > 0 {
+		log.Printf("Authenticating with Service Account Key from Keychain for %s", filePath)
+		clientOptions = append(clientOptions, option.WithCredentialsJSON(keychainKeyContent))
+	} else if impersonateServiceAccount != "" {
+		log.Printf("Authenticating by impersonating Service Account: %s for %s", impersonateServiceAccount, filePath)
 		impersonationScopes := []string{
 			"https://www.googleapis.com/auth/devstorage.read_write",
 		}
@@ -252,6 +284,12 @@ func processSingleFile(filePath string) {
 			return
 		}
 		clientOptions = append(clientOptions, option.WithTokenSource(ts))
+	} else {
+		log.Printf("WARNING: No service account key found in Keychain and no impersonation SA provided for %s. Using Application Default Credentials (may not be sufficient for GCS access).", filePath)
+	}
+
+	if projectID != "" {
+		clientOptions = append(clientOptions, option.WithQuotaProject(projectID))
 	}
 
 	client, err := storage.NewClient(ctx, clientOptions...)
@@ -259,12 +297,12 @@ func processSingleFile(filePath string) {
 		log.Printf("Error creating Google Cloud Storage client for %s: %v", filePath, err)
 		return
 	}
-	defer client.Close() // Ensure GCS client is closed
+	defer client.Close()
 
 	wc := client.Bucket(bucketName).Object(objectName).NewWriter(ctx)
 	if _, err = io.Copy(wc, f); err != nil {
 		log.Printf("Error uploading %s to %s/%s: %v", filePath, bucketName, objectName, err)
-		wc.Close() // Close writer even on error to release resources
+		wc.Close()
 		return
 	}
 
@@ -275,10 +313,8 @@ func processSingleFile(filePath string) {
 
 	log.Printf("Successfully uploaded %s to gs://%s/%s", filePath, bucketName, objectName)
 
-	// Send notification if successful
 	sendNotification("File Uploaded", fmt.Sprintf("Successfully uploaded '%s' to GCS bucket '%s'.", objectName, bucketName))
 
-	// Delete local file after successful upload
 	if err := os.Remove(filePath); err != nil {
 		log.Printf("Error deleting file %s after upload: %v", filePath, err)
 	} else {
@@ -289,7 +325,6 @@ func processSingleFile(filePath string) {
 // sendNotification sends a macOS native notification if running on Darwin.
 func sendNotification(title, message string) {
 	if runtime.GOOS == "darwin" {
-		// Use osascript to display a macOS notification
 		cmd := exec.Command("osascript",
 			"-e", fmt.Sprintf(`display notification "%s" with title "%s" subtitle "%s"`, message, title, bundleIdent))
 		err := cmd.Run()
@@ -298,3 +333,45 @@ func sendNotification(title, message string) {
 		}
 	}
 }
+
+// storeServiceAccountKeyInKeychain stores the service account KEY JSON (as bytes) in macOS Keychain.
+func storeServiceAccountKeyInKeychain(keyJSON []byte) error {
+	// Prepare the item with new data
+	newItem := keychain.NewGenericPassword(keychainSAKeyService, keychainSAKeyAccount, "", keyJSON, "")
+	newItem.SetSynchronizable(keychain.SynchronizableNo)
+	newItem.SetAccessible(keychain.AccessibleWhenUnlocked)
+
+	err := keychain.AddItem(newItem) // Try adding first
+	if err == keychain.ErrorDuplicateItem {
+		// If it's a duplicate, prepare a query for the existing item
+		queryItem := keychain.NewItem()
+		queryItem.SetSecClass(keychain.SecClassGenericPassword)
+		queryItem.SetService(keychainSAKeyService)
+		queryItem.SetAccount(keychainSAKeyAccount)
+
+		// Update the existing item with the data from newItem
+		err = keychain.UpdateItem(queryItem, newItem)
+	}
+	return err
+}
+
+// getServiceAccountKeyFromKeychain retrieves the service account KEY JSON (as bytes) from macOS Keychain.
+func getServiceAccountKeyFromKeychain() ([]byte, error) {
+	query := keychain.NewItem()
+	query.SetSecClass(keychain.SecClassGenericPassword)
+	query.SetService(keychainSAKeyService)
+	query.SetAccount(keychainSAKeyAccount)
+	query.SetMatchLimit(keychain.MatchLimitOne)
+	query.SetReturnData(true)
+
+	results, err := keychain.QueryItem(query)
+	if err != nil {
+		return nil, err
+	}
+	if len(results) == 0 {
+		return nil, fmt.Errorf("service account key not found in Keychain for service '%s', account '%s'", keychainSAKeyService, keychainSAKeyAccount)
+	}
+
+	return results[0].Data, nil
+}
+

@@ -109,7 +109,7 @@ build:
 	@echo "Building Uploader Go executable for macOS ($(VERSION), built $(BUILD_TIME))..."
 	@mkdir -p $(BUILD_DIR)
 	go mod tidy
-	CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build \
+	CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 go build \
 		-ldflags "-X main.version=$(VERSION) -X 'main.buildTime=$(BUILD_TIME)' -X main.bundleIdent=$(BUNDLE_ID)" \
 		-o $(BUILD_DIR)/$(EXECUTABLE_NAME) $(GO_SOURCE)
 	@echo "Uploader Executable built at $(BUILD_DIR)/$(EXECUTABLE_NAME)"

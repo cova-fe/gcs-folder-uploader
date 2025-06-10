@@ -1,10 +1,11 @@
-module uploader
+module gcs-folder-uploader
 
 go 1.24.4
 
 require (
 	cloud.google.com/go/storage v1.55.0
 	github.com/fsnotify/fsnotify v1.9.0
+	github.com/keybase/go-keychain v0.0.1
 	google.golang.org/api v0.236.0
 )
 
