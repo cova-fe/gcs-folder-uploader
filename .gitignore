@@ -2,3 +2,4 @@ build
 terraform/.terraform
 terraform/terraform.*
 gcp-file-sync.app
+examples.sh
