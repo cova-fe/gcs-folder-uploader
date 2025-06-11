@@ -15,7 +15,31 @@ MACOS_DIR := $(APP_BUNDLE_NAME)/Contents/MacOS
 LAUNCHD_PLIST_NAME := $(ORG_NAME).$(APP_NAME)
 LAUNCHD_PLIST_PATH := $(HOME)/Library/LaunchAgents/$(LAUNCHD_PLIST_NAME).plist
 
-VERSION := $(shell git describe --tags --abbrev=0 2>/dev/null || echo "dev") # Use latest git tag or default
+# --- MODIFIED: Determine VERSION with more complex logic ---
+# Get the version string using git describe
+# --tags: Consider all tags
+# --always: Fallback to commit hash if no tags are reachable
+# --dirty: Append -dirty if the working tree is dirty
+# --abbrev=7: Use a 7-character abbreviated object name (SHA)
+# The output will be:
+#   - <tag>                     (if HEAD is exactly on a tag)
+#   - <tag>-<num_commits>-g<sha> (if HEAD is past a tag)
+#   - <sha>                     (if no tags are reachable)
+#   - ...-dirty                 (if the tree is dirty)
+# We then process this output to remove the -g prefix from the SHA.
+GIT_DESCRIBE_RAW := $(shell git describe --tags --always --dirty --abbrev=7 2>/dev/null)
+
+# Remove the 'g' prefix that git describe adds before the commit SHA
+# Example: v1.0.0-1-gabcdef -> v1.0.0-1-abcdef
+# If it's just a tag or a dirty tag, it won't have the -g, so sed won't change it.
+VERSION := $(shell echo "$(GIT_DESCRIBE_RAW)" | sed 's/\(-[0-9]\+-g\)/-\1/; s/-g//')
+
+# Fallback if git describe fails (e.g., not a git repo)
+ifeq ($(VERSION),)
+    VERSION := dev
+endif
+# --- END MODIFIED BLOCK ---
+
 BUILD_TIME := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ") # UTC time
 BUNDLE_ID := $(LAUNCHD_PLIST_NAME) # Aligning Go's bundleIdent for uploader
 
@@ -182,4 +206,3 @@ fmt:
 tidy:
 	@echo "Tidying Go modules..."
 	go mod tidy
-
