@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -24,18 +25,18 @@ import (
 
 // Configuration constants
 const (
-	DebounceDuration          = 1 * time.Second      // Debounce time
+	DebounceDuration           = 3 * time.Second        // Increased debounce time for better stability
 	FileStabilityCheckInterval = 100 * time.Millisecond // How often to check file size
-	FileStabilityDuration      = 500 * time.Millisecond   // How long file size must be stable
+	FileStabilityDuration      = 500 * time.Millisecond // How long file size must be stable
 )
 
 // Global variables for command-line parameters
 var (
-	sourceFolder            string
-	bucketName              string
-	projectID               string
+	sourceFolder              string
+	bucketName                string
+	projectID                 string
 	impersonateServiceAccount string
-	isVerbose               bool
+	isVerbose                 bool
 
 	// Debouncing mechanism for file events
 	debounceMap   = make(map[string]*time.Timer)
@@ -50,7 +51,6 @@ var (
 	keychainSAKeyService = "gcp-file-sync-sa-key"
 	keychainSAKeyAccount = "default" // Using "default" as a common identifier for the key
 )
-
 
 func main() {
 	// 1. Define command-line flags
@@ -139,7 +139,6 @@ func main() {
 	log.Printf("Debounce duration for file events: %s", DebounceDuration)
 	log.Printf("File stability check duration: %s", FileStabilityDuration)
 
-
 	// --- Initial Scan ---
 	log.Println("Performing initial scan of source folder for existing files...")
 	initialFiles, err := os.ReadDir(sourceFolder)
@@ -152,6 +151,8 @@ func main() {
 					log.Printf("Found existing file during initial scan: %s", file.Name())
 				}
 				// Process existing files directly without debouncing, as they should be stable
+				// Note: These files will bypass the debouncer. If they are actively being written
+				// when the app starts, they might be uploaded prematurely.
 				go processSingleFile(filepath.Join(sourceFolder, file.Name()))
 			}
 		}
@@ -181,8 +182,10 @@ func main() {
 				if !ok {
 					return
 				}
-				// We care about creation and writes
-				// CHMOD events can indicate a file is "finished" being written
+				if isVerbose {
+					log.Printf("[DEBUG] Raw fsnotify event: %s on %s", event.Op.String(), event.Name) // Added debug log
+				}
+				// We care about creation, writes, and chmod (often indicates end of write)
 				// RENAME/REMOVE for tracking if file disappears before processing
 				if event.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Chmod) != 0 {
 					if isVerbose {
@@ -219,20 +222,21 @@ func processFileWrapper(filePath string) {
 	defer debounceMutex.Unlock()
 
 	if timer, exists := debounceMap[filePath]; exists {
-		timer.Stop()
+		timer.Stop() // Stop any previous pending timer for this file
 	}
 
 	timer := time.AfterFunc(DebounceDuration, func() {
+		// This block runs AFTER DebounceDuration has passed without new events for this file
 		if isVerbose {
 			log.Printf("Processing debounced file: %s", filePath)
 		}
 		processSingleFile(filePath)
 
-		debounceMutex.Lock()
+		debounceMutex.Lock() // Acquire lock to modify map safely inside the goroutine
 		delete(debounceMap, filePath)
 		debounceMutex.Unlock()
 	})
-	debounceMap[filePath] = timer
+	debounceMap[filePath] = timer // Store the new timer
 }
 
 // processSingleFile contains the core logic for uploading and deleting a single file.
@@ -317,7 +321,10 @@ func processSingleFile(filePath string) {
 	defer client.Close()
 
 	obj := client.Bucket(bucketName).Object(objectName)
-	if _, err := obj.Attrs(ctx); err == nil {
+	// Attempt to get attributes to check for object existence
+	_, err = obj.Attrs(ctx)
+	if err == nil {
+		// Case 1: File already exists in GCS. Log, notify, delete local, then return.
 		log.Printf("File '%s' already exists in GCS bucket '%s'. Skipping upload, proceeding with local deletion.", objectName, bucketName)
 		sendNotification("File Existed", fmt.Sprintf("File '%s' already existed in GCS bucket '%s'. Local file deleted.", objectName, bucketName))
 		if err := os.Remove(filePath); err != nil {
@@ -326,15 +333,24 @@ func processSingleFile(filePath string) {
 			log.Printf("Successfully deleted local file: %s (after confirming GCS existence)", filePath)
 		}
 		return
-	} else if err != storage.ErrObjectNotExist {
+	} else if errors.Is(err, storage.ErrObjectNotExist) { // KEY CHANGE: Using errors.Is for robust error comparison
+		// Case 2: File does NOT exist in GCS. This is the desired state for a new upload.
+		// Proceed to the upload logic below. No log needed here, as we're proceeding.
+	} else {
+		// Case 3: Some other error occurred while checking existence (e.g., permissions, network issue).
+		// Log the error and skip the upload for now.
 		log.Printf("Error checking existence of %s in GCS bucket %s: %v. Skipping upload.", objectName, bucketName, err)
 		return
 	}
 
+	// --- UPLOAD LOGIC STARTS HERE (only if file doesn't exist in GCS) ---
 	wc := obj.NewWriter(ctx)
 	if _, err = io.Copy(wc, f); err != nil {
 		log.Printf("Error uploading %s to %s/%s: %v", filePath, bucketName, objectName, err)
-		wc.Close()
+		// It's crucial to close the writer even if io.Copy fails
+		if cerr := wc.Close(); cerr != nil {
+			log.Printf("Error closing writer after failed upload for %s: %v", objectName, cerr)
+		}
 		return
 	}
 
@@ -350,7 +366,7 @@ func processSingleFile(filePath string) {
 	if err := os.Remove(filePath); err != nil {
 		log.Printf("Error deleting file %s after upload: %v", filePath, err)
 	} else {
-			log.Printf("Successfully deleted local file: %s", filePath)
+		log.Printf("Successfully deleted local file: %s", filePath)
 	}
 }
 
@@ -435,4 +451,3 @@ func getServiceAccountKeyFromKeychain() ([]byte, error) {
 
 	return results[0].Data, nil
 }
-
